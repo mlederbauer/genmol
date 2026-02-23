@@ -25,6 +25,7 @@ import numpy as np
 from tdc import Oracle, Evaluator
 from rdkit import DataStructs, Chem, RDLogger
 from rdkit.Chem import AllChem
+from tqdm import tqdm
 from genmol.sampler import Sampler
 RDLogger.DisableLog('rdApp.*')
 
@@ -32,10 +33,10 @@ RDLogger.DisableLog('rdApp.*')
 def get_distance(smiles, df):
     if 'MOL' not in df:
         df['MOL'] = df['smiles'].apply(Chem.MolFromSmiles)
-    
+
     if 'FPS' not in df:
         df['FPS'] = [AllChem.GetMorganFingerprintAsBitVect(mol, 2, 1024) for mol in df['MOL']]
-    
+
     fps = AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(smiles), 2, 1024)
     return np.mean(DataStructs.BulkTanimotoSimilarity(fps, df['FPS'].tolist(), returnDistance=True))
 
@@ -43,9 +44,11 @@ def get_distance(smiles, df):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', default='hparams.yaml')
-    config = parser.parse_args().config
-    config = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)), config)))
-    
+    parser.add_argument('-o', '--output', default=None,
+                        help='Path to save generated molecules as CSV (e.g. results/frag.csv)')
+    args = parser.parse_args()
+    config = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)), args.config)))
+
     num_samples = config['num_samples']
     evaluator = Evaluator('diversity')
     oracle_qed = Oracle('qed')
@@ -56,22 +59,25 @@ if __name__ == '__main__':
     tasks = ['linker_design', 'motif_extension', 'scaffold_decoration', 'superstructure_generation', 'linker_design_onestep']
     #! Linker Design / Scaffold Morphing = generate a linker fragment that connects given two side chains
     #! Motif Extension = generate molecule with existing motif
-    #! Scaffold Decoration = same as Motif Extension but start with larger scaffold 
+    #! Scaffold Decoration = same as Motif Extension but start with larger scaffold
     #! Superstructure Generation = generate a molecule when a substructure constraint is given
     #! Linker Design (1-step) = generate a linker fragment that connects given two side chains without sequence mixing
 
+    all_results = []
+
     for task in tasks:
+        task_key = task
         if task in ('linker_design', 'scaffold_morphing'):
-            task = 'linker_design'
-            sampling_fn = lambda f: demo.fragment_linking(f, num_samples, **config[task])
+            task_key = 'linker_design'
+            sampling_fn = lambda f: demo.fragment_linking(f, num_samples, **config[task_key])
         elif task in ('motif_extension', 'scaffold_decoration', 'superstructure_generation'):
-            sampling_fn = lambda f: demo.fragment_completion(f, num_samples, **config[task])
+            sampling_fn = lambda f: demo.fragment_completion(f, num_samples, **config[task_key])
         elif task == 'linker_design_onestep':
-            sampling_fn = lambda f: demo.fragment_linking_onestep(f, num_samples, **config[task])
-            task = 'linker_design'
-        
+            sampling_fn = lambda f: demo.fragment_linking_onestep(f, num_samples, **config[task_key])
+            task_key = 'linker_design'
+
         validity, uniqueness, diversity, distance, quality = [], [], [], [], []
-        for original, fragment in zip(data['smiles'], data[task]):
+        for name, original, fragment in tqdm(zip(data['name'], data['smiles'], data[task_key]), total=len(data), desc=f'Processing {task}'):
             samples = sampling_fn(fragment)
             if len(samples) == 0:
                 validity.append(0)
@@ -87,9 +93,14 @@ if __name__ == '__main__':
             else:
                 diversity.append(evaluator(df['smiles']))
             distance.append(get_distance(original, df))
-            df = df[df['qed'] >= 0.6]
-            df = df[df['sa'] <= 4]
-            quality.append(len(df) / num_samples)
+            df['quality'] = (df['qed'] >= 0.6) & (df['sa'] <= 4)
+            quality.append(df['quality'].sum() / num_samples)
+
+            if args.output:
+                df.insert(0, 'fragment', fragment)
+                df.insert(0, 'drug_name', name)
+                df.insert(0, 'task', task)
+                all_results.append(df)
 
         print(f'{task}')
         print(f'\tValidity:\t{np.mean(validity)}')
@@ -98,3 +109,9 @@ if __name__ == '__main__':
         print(f'\tDistance:\t{np.mean(distance)}')
         print(f'\tQuality:\t{np.mean(quality)}')
         print('-' * 50)
+
+    if args.output and all_results:
+        os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+        out_df = pd.concat(all_results, ignore_index=True)
+        out_df.to_csv(args.output, index=False)
+        print(f'Saved {len(out_df)} molecules to {args.output}')
