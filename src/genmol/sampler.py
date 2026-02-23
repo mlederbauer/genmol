@@ -29,13 +29,15 @@ from rdkit import Chem
 from genmol.utils.utils_chem import safe_to_smiles, filter_by_substructure, mix_sequences, Slicer
 from genmol.utils.bracket_safe_converter import BracketSAFEConverter, bracketsafe2safe
 from genmol.model import GenMol
-
+import logging
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
 def load_model_from_path(path):
-    model = GenMol.load_from_checkpoint(path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logging.info(f'Loading model from {path} to {device}')
+    model = GenMol.load_from_checkpoint(path, map_location=device)
     model.backbone.eval()
     if model.ema:
         model.ema.store(itertools.chain(model.backbone.parameters()))

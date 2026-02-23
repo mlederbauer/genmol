@@ -29,15 +29,17 @@ from genmol.sampler import Sampler
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', default='hparams.yaml')
-    config = parser.parse_args().config
-    config = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)), config)))
-    
+    parser.add_argument('-o', '--output', default=None,
+                        help='Path to save generated molecules as CSV (e.g. results/denovo.csv)')
+    args = parser.parse_args()
+    config = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)), args.config)))
+
     num_samples = config['num_samples']
     evaluator = Evaluator('diversity')
     oracle_qed = Oracle('qed')
     oracle_sa = Oracle('sa')
     sampler = Sampler(config['model_path'])
-    
+
     t_start = time()
     samples = sampler.de_novo_generation(num_samples,
                                          softmax_temp=config['softmax_temp'],
@@ -49,6 +51,10 @@ if __name__ == '__main__':
     df = df.drop_duplicates('smiles')
     print(f'Uniqueness:\t{len(df["smiles"]) / len(samples)}')
     print(f'Diversity:\t{evaluator(df["smiles"])}')
-    df = df[df['qed'] >= 0.6]
-    df = df[df['sa'] <= 4]
-    print(f'Quality:\t{len(df) / num_samples}')
+    df['quality'] = (df['qed'] >= 0.6) & (df['sa'] <= 4)
+    print(f'Quality:\t{df["quality"].sum() / num_samples}')
+
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+        df.to_csv(args.output, index=False)
+        print(f'Saved {len(df)} molecules to {args.output}')
