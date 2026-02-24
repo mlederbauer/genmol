@@ -11,10 +11,10 @@ from streamlit_ketcher import st_ketcher
 
 # Runtime setup
 warnings.filterwarnings("ignore")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 CHECKPOINT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "checkpoints", "model_v2.ckpt"
+    os.path.dirname(__file__), "checkpoints", "model_v2.ckpt"
 )
 
 # ─── Task definitions ─────────────────────────────────────────────────────────
@@ -186,6 +186,42 @@ def smiles_to_png(smiles, size=(220, 160)):
     return buf.getvalue()
 
 
+def fix_bridging_wildcards(smiles):
+    """Convert Ketcher R-group bridging [*] (degree > 1) into separate terminal [*] atoms.
+
+    Ketcher's "R" label creates a single [*] atom bonded to multiple heavy atoms
+    (degree ≥ 2). The SAFE encoder treats these as ring-closure tokens, so the
+    intended attachment information is lost.  This function splits each such
+    bridging wildcard into one pendant [*] per neighbour and returns the
+    corrected SMILES together with a flag indicating whether a fix was applied.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    bridging = [a.GetIdx() for a in mol.GetAtoms()
+                if a.GetAtomicNum() == 0 and a.GetDegree() > 1]
+    if not bridging:
+        return Chem.MolToSmiles(mol), False
+
+    rw = Chem.RWMol(mol)
+    # Process in reverse index order so removals don't shift earlier indices
+    for idx in sorted(bridging, reverse=True):
+        neighbors = [n.GetIdx() for n in rw.GetAtomWithIdx(idx).GetNeighbors()]
+        for n_idx in neighbors:
+            rw.RemoveBond(idx, n_idx)
+        for n_idx in neighbors:
+            wc = rw.AddAtom(Chem.Atom(0))
+            rw.AddBond(n_idx, wc, Chem.BondType.SINGLE)
+        rw.RemoveAtom(idx)
+
+    try:
+        Chem.SanitizeMol(rw)
+        return Chem.MolToSmiles(rw), True
+    except Exception:
+        return None, False
+
+
 def fragment_input(label, key, hint=""):
     """Render a Ketcher drawer + editable SMILES box; return the final SMILES string."""
     method = st.radio(
@@ -195,16 +231,25 @@ def fragment_input(label, key, hint=""):
         key=f"method_{key}",
     )
     if method == "Draw":
-        drawn = st_ketcher(key=key)
-        # Let the user refine the Ketcher output (e.g. to add [*])
+        drawn = st_ketcher(key=key) or ""
+        edit_key = f"edit_{key}"
+        last_key = f"_last_drawn_{key}"
+        # When Ketcher returns a NEW SMILES (Apply clicked), push it into
+        # the text_input's session-state entry. Streamlit pre-loads browser
+        # widget values before the script runs, which can override a plain
+        # session-state assignment; calling st.rerun() forces a second pass
+        # where our value is used unambiguously.
+        if drawn and drawn != st.session_state.get(last_key, ""):
+            st.session_state[last_key] = drawn
+            st.session_state[edit_key] = drawn
+            st.rerun()
         smiles = st.text_input(
             "Edit SMILES (add `[*]` for attachment points)",
-            value=drawn or "",
             placeholder=hint,
-            key=f"edit_{key}",
+            key=edit_key,
             help=(
-                "Insert [*] at any position in the SMILES to mark where the linker "
-                "or extension should attach. Example: change `CCCCC` to `[*]CCCCC`."
+                "Insert [*] at any position to mark where the linker / extension "
+                "should attach. Example: change `CCCCC` to `[*]CCCCC`."
             ),
         )
     else:
@@ -216,12 +261,41 @@ def fragment_input(label, key, hint=""):
 
     if smiles:
         mol = Chem.MolFromSmiles(smiles)
-        if mol:
-            png = smiles_to_png(smiles, size=(300, 200))
-            st.image(png, caption=smiles)
-        else:
+        if mol is None:
             st.error("Invalid SMILES — please fix before generating.")
             smiles = ""
+        else:
+            # Auto-fix Ketcher R-group bridging wildcards (degree > 1)
+            fixed, was_fixed = fix_bridging_wildcards(smiles)
+            if fixed is None:
+                st.error(
+                    "Could not fix bridging `[*]` atoms from the Ketcher R-group. "
+                    "Please manually edit the SMILES so each `[*]` is a terminal attachment point "
+                    "(bonded to exactly one heavy atom)."
+                )
+                smiles = ""
+            else:
+                if was_fixed:
+                    st.info(
+                        f"Ketcher R-group `[*]` (bridging) auto-converted to terminal attachment points.  "
+                        f"Fixed SMILES: `{fixed}`"
+                    )
+                    smiles = fixed
+                # Warn if [*] is inside a ring (degree 2 but ring member)
+                fixed_mol = Chem.MolFromSmiles(smiles)
+                if fixed_mol:
+                    ring_atoms = set(idx for ring in fixed_mol.GetRingInfo().AtomRings() for idx in ring)
+                    ring_wildcards = [
+                        a for a in fixed_mol.GetAtoms()
+                        if a.GetAtomicNum() == 0 and a.GetIdx() in ring_atoms
+                    ]
+                    if ring_wildcards:
+                        st.warning(
+                            "`[*]` is inside a ring — this is unlikely to work correctly. "
+                            "Place `[*]` as a pendant substituent outside any ring, e.g. `[*]c1ccccc1`."
+                        )
+                png = smiles_to_png(smiles, size=(300, 200))
+                st.image(png, caption=smiles)
     return smiles or ""
 
 
