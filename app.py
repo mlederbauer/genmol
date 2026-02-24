@@ -72,10 +72,9 @@ TASKS = {
             "min_add_len": 24,
         },
     },
-    "Linker Design (1-step)": {
+    "Linker Design": {
         "description": (
             "Connect two fragments with a linker in a single generation pass. "
-            "Recommended with the V2 model. "
             "Each fragment should have a `[*]` attachment point."
         ),
         "num_fragments": 2,
@@ -86,19 +85,19 @@ TASKS = {
             "min_add_len": 30,
         },
     },
-    "Linker Design (2-step)": {
-        "description": (
-            "Connect two fragments with a linker via two separate generation passes, "
-            "then combine. Each fragment should have a `[*]` attachment point."
-        ),
-        "num_fragments": 2,
-        "defaults": {
-            "softmax_temp": 1.2,
-            "randomness": 3.0,
-            "gamma": 0.0,
-            "min_add_len": 30,
-        },
-    },
+    # "Linker Design (2-step)": {
+    #     "description": (
+    #         "Connect two fragments with a linker via two separate generation passes, "
+    #         "then combine. Each fragment should have a `[*]` attachment point."
+    #     ),
+    #     "num_fragments": 2,
+    #     "defaults": {
+    #         "softmax_temp": 1.2,
+    #         "randomness": 3.0,
+    #         "gamma": 0.0,
+    #         "min_add_len": 30,
+    #     },
+    # },
 }
 
 # ─── Cached model loader ──────────────────────────────────────────────────────
