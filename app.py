@@ -439,12 +439,7 @@ def render_mqn_map(mqn_data, generated_smiles=None):
             mode="markers",
             marker=dict(size=5, color="rgba(150,210,255,0.45)", line=dict(width=0)),
             customdata=bg_customdata,
-            hovertemplate=(
-                "<b>PubChem</b><br>"
-                "<img src='data:image/png;base64,%{customdata[1]}' width='150'><br>"
-                "<span style='font-size:10px;font-family:monospace'>%{customdata[0]}</span>"
-                "<extra></extra>"
-            ),
+            hovertemplate="<extra></extra>",
             name="PubChem",
         ))
 
@@ -462,11 +457,7 @@ def render_mqn_map(mqn_data, generated_smiles=None):
                 marker=dict(size=12, color="rgba(255,100,0,0.9)",
                             line=dict(width=1, color="white"), symbol="star"),
                 customdata=customdata,
-                hovertemplate=(
-                    "<img src='data:image/png;base64,%{customdata[1]}' width='200'><br>"
-                    "<span style='font-size:11px;font-family:monospace'>%{customdata[0]}</span>"
-                    "<extra>Generated</extra>"
-                ),
+                hovertemplate="<extra></extra>",
                 name="Generated",
             ))
 
