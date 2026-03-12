@@ -1,8 +1,10 @@
+import base64
 import io
 import os
 import sys
 import warnings
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from rdkit import Chem
@@ -12,6 +14,9 @@ from streamlit_ketcher import st_ketcher
 # Runtime setup
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+
+TMAP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "data", "tmap_cache")
+MAPPLET_DIR = os.path.join(os.path.dirname(__file__), "extracted_mapplet", "dbases", "Pubchem.60")
 
 CHECKPOINT_PATH = os.path.join(
     os.path.dirname(__file__), "checkpoints", "model_v2.ckpt"
@@ -175,6 +180,16 @@ def compute_properties(smiles_list):
     return pd.DataFrame(rows)
 
 
+def smiles_to_b64(smiles, size=(220, 160)):
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return ""
+    img = Draw.MolToImage(mol, size=size)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def smiles_to_png(smiles, size=(220, 160)):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -296,6 +311,315 @@ def fragment_input(label, key, hint=""):
                 png = smiles_to_png(smiles, size=(300, 200))
                 st.image(png, caption=smiles)
     return smiles or ""
+
+
+# ─── MQN chemical space (PubChem mapplet) ─────────────────────────────────────
+
+@st.cache_resource(show_spinner="Loading PubChem MQN map…")
+def load_mqn_map(mapplet_dir):
+    """Load MQN PCA data, density grid, and sampled background molecules.
+    Returns (avgs, eigenvecs, eigenvals, x_range, y_range, density, bg_x, bg_y, bg_smiles) or None."""
+    misc_dir = os.path.join(mapplet_dir, "misc")
+    avgs_path = os.path.join(misc_dir, "Pubchem.60.avgs")
+    eweV_path = os.path.join(misc_dir, "Pubchem.60.eWeV")
+    minmax_path = os.path.join(misc_dir, "Pubchem.60.totalminmax")
+    dens_path = os.path.join(mapplet_dir, "dens.gz")
+    avgmol_path = os.path.join(mapplet_dir, "avgmol.gz")
+    if not all(os.path.exists(p) for p in [avgs_path, eweV_path, minmax_path, dens_path]):
+        return None
+
+    with open(avgs_path) as f:
+        avgs = np.array([float(x) for x in f.read().strip().rstrip(";").split(";")])
+
+    eigenvecs, eigenvals = [], []
+    with open(eweV_path) as f:
+        for line in f:
+            parts = line.strip().split(" ", 1)
+            eigenvals.append(float(parts[0]))
+            eigenvecs.append([float(x) for x in parts[1].rstrip(";").split(";")])
+    eigenvecs = np.array(eigenvecs)
+    eigenvals = np.array(eigenvals)
+
+    with open(minmax_path) as f:
+        xy = f.read().strip().split()
+        x_range = [float(v) for v in xy[0].split(";")]
+        y_range = [float(v) for v in xy[1].split(";")]
+
+    import gzip as _gzip
+    from scipy.ndimage import zoom as _zoom
+    with _gzip.open(dens_path, "rb") as f:
+        raw = f.read().decode("utf-8")
+    grid_rows = []
+    for row in raw.split("\n"):
+        if not row:
+            continue
+        grid_rows.append([float(v) if v else 0.0 for v in row.split("\t")])
+    density = np.array(grid_rows, dtype=np.float32)
+    factor = 250 / density.shape[0]
+    density_small = _zoom(np.log1p(density), factor, order=1)
+
+    # Load representative background molecules from avgmol.gz.
+    # The grid is 1000×1000; each occupied cell stores the SMILES of the
+    # most representative PubChem molecule in that region.
+    bg_x, bg_y, bg_smiles = [], [], []
+    if os.path.exists(avgmol_path):
+        with _gzip.open(avgmol_path, "rb") as f:
+            raw_mol = f.read().decode("utf-8", errors="replace")
+        grid_size = 1000
+        occupied = []
+        for ri, row in enumerate(raw_mol.split("\n")):
+            if not row:
+                continue
+            for ci, cell in enumerate(row.split("\t")):
+                cell = cell.strip()
+                if cell and cell != "-":
+                    occupied.append((ri, ci, cell))
+        rng = np.random.default_rng(42)
+        MAX_BG = 3000
+        if len(occupied) > MAX_BG:
+            idxs = rng.choice(len(occupied), MAX_BG, replace=False)
+            occupied = [occupied[i] for i in idxs]
+        for ri, ci, smi in occupied:
+            bg_x.append(x_range[0] + ci * (x_range[1] - x_range[0]) / (grid_size - 1))
+            bg_y.append(y_range[0] + ri * (y_range[1] - y_range[0]) / (grid_size - 1))
+            bg_smiles.append(smi)
+
+    # Precompute small thumbnails for hover (cached here so it only runs once)
+    bg_imgs = [smiles_to_b64(smi, size=(120, 80)) for smi in bg_smiles]
+
+    return avgs, eigenvecs, eigenvals, x_range, y_range, density_small, bg_x, bg_y, bg_smiles, bg_imgs
+
+
+def smiles_to_mqn_coords(smiles_list, avgs, eigenvecs, eigenvals):
+    """Project a list of SMILES onto the MQN PCA map. Returns (xs, ys) lists."""
+    from rdkit.Chem import rdMolDescriptors
+    xs, ys = [], []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(str(smi))
+        if mol is None:
+            xs.append(None); ys.append(None)
+            continue
+        mqn = np.array(list(rdMolDescriptors.MQNs_(mol)), dtype=float)
+        centered = mqn - avgs
+        xs.append(float(np.dot(centered, eigenvecs[0]) / np.sqrt(eigenvals[0])))
+        ys.append(float(np.dot(centered, eigenvecs[1]) / np.sqrt(eigenvals[1])))
+    return xs, ys
+
+
+def render_mqn_map(mqn_data, generated_smiles=None):
+    """Render the interactive PubChem MQN map.
+
+    - Background: density heatmap of 24M PubChem molecules.
+    - Light dots: 3000 sampled representative PubChem molecules (hover = SMILES).
+    - Orange stars: generated molecules (hover = molecule image + SMILES).
+    - Clicking any dot or star shows the full structure below the map.
+    """
+    import plotly.graph_objects as go
+
+    avgs, eigenvecs, eigenvals, x_range, y_range, density, bg_x, bg_y, bg_smiles, bg_imgs = mqn_data
+
+    fig = go.Figure()
+
+    # Density heatmap
+    fig.add_trace(go.Heatmap(
+        z=density,
+        x=np.linspace(x_range[0], x_range[1], density.shape[1]),
+        y=np.linspace(y_range[0], y_range[1], density.shape[0]),
+        colorscale="Blues",
+        showscale=False,
+        hoverinfo="skip",
+        name="PubChem density",
+    ))
+
+    # Background representative molecules — hover shows molecule image + SMILES
+    if bg_smiles:
+        bg_customdata = [[smi, img] for smi, img in zip(bg_smiles, bg_imgs)]
+        fig.add_trace(go.Scattergl(
+            x=bg_x, y=bg_y,
+            mode="markers",
+            marker=dict(size=5, color="rgba(150,210,255,0.45)", line=dict(width=0)),
+            customdata=bg_customdata,
+            hovertemplate=(
+                "<b>PubChem</b><br>"
+                "<img src='data:image/png;base64,%{customdata[1]}' width='150'><br>"
+                "<span style='font-size:10px;font-family:monospace'>%{customdata[0]}</span>"
+                "<extra></extra>"
+            ),
+            name="PubChem",
+        ))
+
+    # Generated molecules — hover shows molecule image + SMILES
+    if generated_smiles:
+        xs, ys = smiles_to_mqn_coords(generated_smiles, avgs, eigenvecs, eigenvals)
+        valid = [(s, x, y) for s, x, y in zip(generated_smiles, xs, ys) if x is not None]
+        if valid:
+            smi_v, xs_v, ys_v = zip(*valid)
+            imgs = [smiles_to_b64(s) for s in smi_v]
+            customdata = [[s, img] for s, img in zip(smi_v, imgs)]
+            fig.add_trace(go.Scatter(
+                x=list(xs_v), y=list(ys_v),
+                mode="markers",
+                marker=dict(size=12, color="rgba(255,100,0,0.9)",
+                            line=dict(width=1, color="white"), symbol="star"),
+                customdata=customdata,
+                hovertemplate=(
+                    "<img src='data:image/png;base64,%{customdata[1]}' width='200'><br>"
+                    "<span style='font-size:11px;font-family:monospace'>%{customdata[0]}</span>"
+                    "<extra>Generated</extra>"
+                ),
+                name="Generated",
+            ))
+
+    fig.update_layout(
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        plot_bgcolor="#0e1117", paper_bgcolor="#0e1117", font_color="white",
+        margin=dict(l=10, r=10, t=30, b=10), height=550,
+        legend=dict(x=0.01, y=0.99),
+        clickmode="event+select",
+    )
+
+    event = st.plotly_chart(
+        fig, use_container_width=True,
+        on_select="rerun", selection_mode="points",
+        key="mqn_map",
+    )
+
+    # Show clicked molecule below the map
+    if event and event.selection and event.selection.points:
+        pt = event.selection.points[0]
+        cd = pt.get("customdata")
+        if cd is not None:
+            # Generated point: customdata = [smiles, b64img]
+            # PubChem point:   customdata = smiles string
+            smi = cd[0] if isinstance(cd, list) else cd
+            st.markdown("**Selected molecule**")
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                png = smiles_to_png(smi, size=(240, 180))
+                if png:
+                    st.image(png)
+            with c2:
+                st.code(smi, language="text")
+
+
+# ─── Chemical space helpers ───────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner="Loading chemical space map…")
+def load_tmap_cache(cache_dir):
+    """Load pre-computed TMAP artefacts. Returns (ref_df, x_ref, y_ref) or None."""
+    coords_path = os.path.join(cache_dir, "coords.npz")
+    ref_path = os.path.join(cache_dir, "reference.csv")
+    lf_path = os.path.join(cache_dir, "lf.dat")
+    if not all(os.path.exists(p) for p in [coords_path, ref_path, lf_path]):
+        return None
+    coords = np.load(coords_path)
+    ref_df = pd.read_csv(ref_path)
+    return ref_df, coords["x"], coords["y"]
+
+
+def project_molecules_onto_map(smiles_list, cache_dir, k=15):
+    """Project SMILES onto pre-built TMAP. Returns (px, py) lists (None for invalid)."""
+    import tmap as tm
+    from mhfp.encoder import MHFPEncoder
+    from rdkit.Chem import AllChem
+
+    MHFP_DIM, LSH_TREES = 1024, 64
+    lf = tm.LSHForest(MHFP_DIM, LSH_TREES)
+    lf.restore(os.path.join(cache_dir, "lf.dat"))
+    coords = np.load(os.path.join(cache_dir, "coords.npz"))
+    x_ref, y_ref = coords["x"], coords["y"]
+
+    enc = MHFPEncoder(MHFP_DIM)
+    proj_x, proj_y = [], []
+    for smi in smiles_list:
+        mol = AllChem.MolFromSmiles(str(smi))
+        if mol is None:
+            proj_x.append(None); proj_y.append(None)
+            continue
+        fp = tm.VectorUint(enc.encode_mol(mol))
+        indices, dists = lf.query_linear_scan_by_vector(fp, k, 0, False)
+        if not indices:
+            proj_x.append(None); proj_y.append(None)
+            continue
+        dists = np.array(dists, dtype=float)
+        weights = 1.0 / (dists + 1e-6)
+        weights /= weights.sum()
+        proj_x.append(float(np.dot(weights, [x_ref[i] for i in indices])))
+        proj_y.append(float(np.dot(weights, [y_ref[i] for i in indices])))
+    return proj_x, proj_y
+
+
+def render_chemical_space(ref_df, x_ref, y_ref, generated_smiles=None):
+    """Render an interactive Plotly scatter of reference + (optionally) generated molecules."""
+    import plotly.graph_objects as go
+
+    # Subsample reference for rendering speed (plotly handles ~50K points fine)
+    MAX_REF = 50_000
+    if len(ref_df) > MAX_REF:
+        idx = np.random.default_rng(0).choice(len(ref_df), MAX_REF, replace=False)
+        plot_df = ref_df.iloc[idx].reset_index(drop=True)
+        px_ref = x_ref[idx]
+        py_ref = y_ref[idx]
+    else:
+        plot_df = ref_df
+        px_ref = x_ref
+        py_ref = y_ref
+
+    hover_ref = plot_df["smiles"] if "smiles" in plot_df.columns else [""] * len(plot_df)
+    color_col = "qed" if "qed" in plot_df.columns else None
+
+    ref_trace = go.Scattergl(
+        x=px_ref, y=py_ref,
+        mode="markers",
+        marker=dict(
+            size=3,
+            color=plot_df[color_col].tolist() if color_col else "rgba(180,180,180,0.4)",
+            colorscale="Viridis",
+            showscale=bool(color_col),
+            colorbar=dict(title="QED", thickness=12) if color_col else None,
+            opacity=0.4,
+        ),
+        text=hover_ref,
+        hovertemplate="%{text}<extra>reference</extra>",
+        name="Reference",
+    )
+
+    fig = go.Figure(data=[ref_trace])
+
+    if generated_smiles:
+        with st.spinner("Projecting generated molecules onto the map…"):
+            gx, gy = project_molecules_onto_map(generated_smiles, TMAP_CACHE_DIR)
+
+        valid = [(s, x, y) for s, x, y in zip(generated_smiles, gx, gy) if x is not None]
+        if valid:
+            smi_v, gx_v, gy_v = zip(*valid)
+            gen_trace = go.Scattergl(
+                x=list(gx_v), y=list(gy_v),
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color="rgba(255, 100, 0, 0.9)",
+                    line=dict(width=1, color="white"),
+                    symbol="star",
+                ),
+                text=list(smi_v),
+                hovertemplate="%{text}<extra>generated</extra>",
+                name="Generated",
+            )
+            fig.add_trace(gen_trace)
+
+    fig.update_layout(
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font_color="white",
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=550,
+        legend=dict(x=0.01, y=0.99),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ─── Page layout ─────────────────────────────────────────────────────────────
@@ -452,48 +776,83 @@ if generate_btn:
                 results = []
 
         if results:
-            df = compute_properties(results)
-
-            # Summary metrics
-            st.subheader("Results")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Requested", num_samples)
-            c2.metric("Valid", len(df))
-            c3.metric("Unique", int(df["smiles"].nunique()))
-            avg_qed = f"{df['qed'].mean():.3f}" if len(df) else "—"
-            c4.metric("Avg QED", avg_qed)
-
-            # Molecule gallery (up to 20)
-            st.subheader("Gallery")
-            display = df.head(20)
-            n_cols = 4
-            for row_start in range(0, len(display), n_cols):
-                row_slice = display.iloc[row_start : row_start + n_cols]
-                cols = st.columns(n_cols)
-                for j, (_, row) in enumerate(row_slice.iterrows()):
-                    with cols[j]:
-                        png = smiles_to_png(row["smiles"])
-                        if png:
-                            st.image(png)
-                        st.caption(
-                            f"QED={row['qed']}  MW={row['mw']}  logP={row['logp']}"
-                        )
-                        with st.expander("SMILES"):
-                            st.code(row["smiles"], language="text")
-
-            # Full data table
-            st.subheader("Data table")
-            st.dataframe(df, use_container_width=True)
-
-            # Download
-            st.download_button(
-                "Download CSV",
-                df.to_csv(index=False),
-                file_name="genmol_results.csv",
-                mime="text/csv",
-            )
+            st.session_state["genmol_df"] = compute_properties(results)
+            st.session_state["genmol_num_samples"] = num_samples
         else:
+            st.session_state.pop("genmol_df", None)
             st.warning(
                 "No valid molecules were generated. "
                 "Try increasing the number of samples or adjusting the parameters."
             )
+
+# ─── Results (rendered from session state so map clicks don't wipe them) ──────
+
+if "genmol_df" in st.session_state:
+    df = st.session_state["genmol_df"]
+    requested = st.session_state.get("genmol_num_samples", len(df))
+
+    # Summary metrics
+    st.subheader("Results")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Requested", requested)
+    c2.metric("Valid", len(df))
+    c3.metric("Unique", int(df["smiles"].nunique()))
+    avg_qed = f"{df['qed'].mean():.3f}" if len(df) else "—"
+    c4.metric("Avg QED", avg_qed)
+
+    # Molecule gallery (up to 20)
+    st.subheader("Gallery")
+    display = df.head(20)
+    n_cols = 4
+    for row_start in range(0, len(display), n_cols):
+        row_slice = display.iloc[row_start : row_start + n_cols]
+        cols = st.columns(n_cols)
+        for j, (_, row) in enumerate(row_slice.iterrows()):
+            with cols[j]:
+                png = smiles_to_png(row["smiles"])
+                if png:
+                    st.image(png)
+                st.caption(
+                    f"QED={row['qed']}  MW={row['mw']}  logP={row['logp']}"
+                )
+                with st.expander("SMILES"):
+                    st.code(row["smiles"], language="text")
+
+    # Full data table
+    st.subheader("Data table")
+    st.dataframe(df, use_container_width=True)
+
+    # Download
+    st.download_button(
+        "Download CSV",
+        df.to_csv(index=False),
+        file_name="genmol_results.csv",
+        mime="text/csv",
+    )
+
+    # Chemical space
+    st.subheader("Chemical space")
+    mqn_data = load_mqn_map(MAPPLET_DIR)
+    if mqn_data is not None:
+        st.caption(
+            "PubChem chemical space (MQN-PCA map). "
+            "Stars = generated molecules. Click any point to see its structure."
+        )
+        render_mqn_map(mqn_data, generated_smiles=df["smiles"].tolist())
+    else:
+        tmap_data = load_tmap_cache(TMAP_CACHE_DIR)
+        if tmap_data is None:
+            st.info(
+                "No chemical space map found. "
+                "Place the extracted MQN mapplet at `extracted_mapplet/` or "
+                "run the precompute script to build a TMAP:\n\n"
+                "```bash\n"
+                "python scripts/calculate_chemical_space.py build \\\n"
+                "    --input /path/to/reference_molecules.smi \\\n"
+                f"    --max-molecules 100000 \\\n"
+                f"    --out data/tmap_cache/\n"
+                "```"
+            )
+        else:
+            ref_df, x_ref, y_ref = tmap_data
+            render_chemical_space(ref_df, x_ref, y_ref, generated_smiles=df["smiles"].tolist())

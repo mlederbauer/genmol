@@ -22,3 +22,6 @@ share/python-wheels/
 MANIFEST
 
 checkpoints/
+tmp/
+.claude/
+extracted_mapplet/
