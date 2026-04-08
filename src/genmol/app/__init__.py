@@ -11,12 +11,9 @@ import warnings
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 from IPython.display import HTML, display
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Draw, QED
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -164,13 +161,17 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
     """Plot a 2-D PCA of ECFP4 fingerprints with Plotly.
 
     Reference molecules are shown as small grey dots; generated molecules
-    as large coloured markers. Hovering shows the 2D structure as an SVG.
+    as large coloured markers. Hovering shows SMILES and properties.
 
     Args:
         reference_smiles:  List of reference SMILES (e.g. a PubChem sample).
         generated_smiles:  List of newly generated SMILES.
         n_ref_display:     Max reference molecules to show (for performance).
     """
+    import plotly.graph_objects as go
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
     if not generated_smiles:
         print("No generated molecules to plot. Run a generation task first.")
         return
@@ -183,30 +184,26 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
     else:
         ref_display = list(reference_smiles)
 
-    all_smiles = ref_display + list(generated_smiles)
-    fps, valid_smi = _ecfp4(all_smiles)
+    ref_fps, ref_valid = _ecfp4(ref_display)
+    gen_fps, gen_smi  = _ecfp4(list(generated_smiles))
 
-    if len(fps) < 3:
+    if len(ref_fps) + len(gen_fps) < 3 or len(gen_fps) == 0:
         print("Not enough valid molecules to compute PCA.")
         return
 
-    n_ref = sum(1 for s in valid_smi if s in set(ref_display))
+    all_fps = np.vstack([ref_fps, gen_fps])
+    n_ref   = len(ref_fps)
 
     coords = PCA(n_components=2).fit_transform(
-        StandardScaler(with_std=False).fit_transform(fps)
+        StandardScaler(with_std=False).fit_transform(all_fps)
     )
 
     ref_coords = coords[:n_ref]
     gen_coords = coords[n_ref:]
-    gen_smi    = valid_smi[n_ref:]
 
-    # Build SVG tooltips for generated molecules
     gen_props = compute_properties(gen_smi)
     tooltips = []
     for smi in gen_smi:
-        svg = _mol_to_svg(smi, size=(180, 130))
-        # Encode SVG as a data URI for the hover image
-        svg_b64 = base64.b64encode(svg.encode()).decode()
         row = gen_props[gen_props["SMILES"] == smi]
         prop_str = ""
         if not row.empty:
@@ -216,7 +213,6 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
 
     fig = go.Figure()
 
-    # Reference background
     fig.add_trace(go.Scatter(
         x=ref_coords[:, 0], y=ref_coords[:, 1],
         mode="markers",
@@ -225,7 +221,6 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
         hoverinfo="skip",
     ))
 
-    # Generated molecules
     fig.add_trace(go.Scatter(
         x=gen_coords[:, 0], y=gen_coords[:, 1],
         mode="markers",
