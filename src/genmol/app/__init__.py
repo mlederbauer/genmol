@@ -157,45 +157,46 @@ def _ecfp4(smiles_list, radius=2, n_bits=2048):
     return np.array(fps), valid_smi
 
 
-def _svg_data_uri(smiles, size=(180, 130)):
-    """Return an SVG data URI for embedding in Plotly hover HTML."""
-    from rdkit.Chem.Draw import rdMolDraw2D
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return ""
-    drawer = rdMolDraw2D.MolDraw2DSVG(size[0], size[1])
-    drawer.drawOptions().clearBackground = True
-    drawer.DrawMolecule(mol)
-    drawer.FinishDrawing()
-    svg = drawer.GetDrawingText()
-    b64 = base64.b64encode(svg.encode()).decode()
-    return f"data:image/svg+xml;base64,{b64}"
-
-
 def _nearest_ref_smiles(gen_fp, ref_fps, ref_smi_list, k=3):
-    """Return the k reference SMILES nearest to gen_fp by Tanimoto distance."""
-    from rdkit.DataStructs import BulkTanimotoSimilarity, CreateFromBitString
-    # Reconstruct bit vectors for bulk similarity — use dot product on packed arrays
-    sims = ref_fps @ gen_fp / (
-        ref_fps.sum(axis=1) + gen_fp.sum() - ref_fps @ gen_fp + 1e-9
-    )
+    """Return the k reference SMILES nearest to gen_fp by Tanimoto similarity."""
+    gen_fp = gen_fp.astype(float)
+    ref_fps_f = ref_fps.astype(float)
+    dot = ref_fps_f @ gen_fp
+    sims = dot / (ref_fps_f.sum(axis=1) + gen_fp.sum() - dot + 1e-9)
     top_k = np.argsort(sims)[::-1][:k]
     return [ref_smi_list[i] for i in top_k]
 
 
-def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
-    """Plot a 2-D PCA of ECFP4 fingerprints with Plotly.
+def _mol_grid_html(smiles_list, size=(160, 120), label=None):
+    """Return an HTML string showing molecule images side by side."""
+    imgs = []
+    for smi in smiles_list:
+        b64 = _mol_to_png_b64(smi, size=size)
+        if b64:
+            imgs.append(
+                f'<div style="display:inline-block;text-align:center;margin:4px">'
+                f'<img src="data:image/png;base64,{b64}" style="width:{size[0]}px"/>'
+                f'<div style="font-size:10px;font-family:monospace;max-width:{size[0]}px;'
+                f'word-break:break-all">{smi}</div></div>'
+            )
+    header = f'<div style="font-weight:bold;margin-bottom:4px">{label}</div>' if label else ""
+    return header + '<div style="display:flex;flex-wrap:wrap">' + "".join(imgs) + "</div>"
 
-    Reference molecules are shown as small grey dots with molecule images on
-    hover; generated molecules as large coloured markers with structure images
-    and properties on hover.
+
+def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
+    """Plot a 2-D PCA of ECFP4 fingerprints.
+
+    Click any point to see its 2D structure and (for generated molecules) the
+    3 nearest PubChem neighbours rendered below the plot.
 
     Args:
         reference_smiles:  List of reference SMILES (e.g. a PubChem sample).
         generated_smiles:  List of newly generated SMILES.
-        n_ref_display:     Max reference molecules to show (for performance).
+        n_ref_display:     Max reference molecules shown (for performance).
     """
     import plotly.graph_objects as go
+    from ipywidgets import Output
+    from IPython.display import clear_output
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
 
@@ -203,7 +204,6 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
         print("No generated molecules to plot. Run a generation task first.")
         return
 
-    # Subsample reference for display only
     rng = np.random.default_rng(42)
     if len(reference_smiles) > n_ref_display:
         idx = rng.choice(len(reference_smiles), n_ref_display, replace=False)
@@ -224,35 +224,20 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
     coords = PCA(n_components=2).fit_transform(
         StandardScaler(with_std=False).fit_transform(all_fps)
     )
-
     ref_coords = coords[:n_ref]
     gen_coords = coords[n_ref:]
 
-    # --- Reference hover: molecule image only (sampled subset for speed) ---
-    ref_hover = []
-    for smi in ref_valid:
-        uri = _svg_data_uri(smi, size=(160, 120))
-        ref_hover.append(
-            f'<img src="{uri}" style="background:white"/><br>'
-            f'<span style="font-size:10px">{smi}</span>'
-            if uri else smi
-        )
-
-    # --- Generated hover: molecule image + properties ---
     gen_props = compute_properties(gen_smi)
-    gen_hover = []
-    for smi in gen_smi:
-        uri = _svg_data_uri(smi, size=(200, 150))
-        gen_hover.append(f'<img src="{uri}" style="background:white"/>' if uri else smi)
 
-    fig = go.Figure()
+    # Build figure
+    fig = go.FigureWidget()
 
     fig.add_trace(go.Scatter(
         x=ref_coords[:, 0], y=ref_coords[:, 1],
         mode="markers",
         marker=dict(color="lightgrey", size=4, opacity=0.5),
         name="PubChem reference",
-        text=ref_hover,
+        text=ref_valid,
         hovertemplate="%{text}<extra>Reference</extra>",
     ))
 
@@ -266,22 +251,49 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
             colorbar=dict(title="QED"),
             line=dict(width=1, color="white"),
         ),
-        text=gen_hover,
-        hovertemplate="%{text}<extra>Generated</extra>",
         name="Generated",
+        text=gen_smi,
+        hovertemplate="%{text}<extra>Generated</extra>",
     ))
 
     fig.update_layout(
-        title="Chemical space — PCA of ECFP4 fingerprints",
+        title="Chemical space — PCA of ECFP4 fingerprints<br>"
+              "<sup>Click any point to see its structure and nearest neighbours</sup>",
         xaxis_title="PC 1",
         yaxis_title="PC 2",
         legend=dict(orientation="h", y=-0.12),
-        height=580,
-        hoverlabel=dict(bgcolor="white", font_size=12),
+        height=560,
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
     fig.update_xaxes(showgrid=True, gridcolor="#eeeeee", zeroline=False)
     fig.update_yaxes(showgrid=True, gridcolor="#eeeeee", zeroline=False)
 
-    fig.show()
+    # Output widget that displays clicked molecule(s) below the plot
+    detail_out = Output()
+
+    def on_click(trace, points, state):
+        if not points.point_inds:
+            return
+        idx = points.point_inds[0]
+        with detail_out:
+            clear_output(wait=True)
+            is_generated = (trace.name == "Generated")
+            clicked_smi = gen_smi[idx] if is_generated else ref_valid[idx]
+
+            if is_generated:
+                neighbours = _nearest_ref_smiles(gen_fps[idx], ref_fps, ref_valid, k=3)
+                html = (
+                    _mol_grid_html([clicked_smi], size=(200, 150), label="Generated molecule") +
+                    _mol_grid_html(neighbours, size=(160, 120), label="3 nearest PubChem neighbours")
+                )
+            else:
+                html = _mol_grid_html([clicked_smi], size=(200, 150), label="PubChem reference")
+
+            display(HTML(html))
+
+    fig.data[0].on_click(on_click)  # reference trace
+    fig.data[1].on_click(on_click)  # generated trace
+
+    display(fig)
+    display(detail_out)
