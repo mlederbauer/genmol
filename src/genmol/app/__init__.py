@@ -157,11 +157,38 @@ def _ecfp4(smiles_list, radius=2, n_bits=2048):
     return np.array(fps), valid_smi
 
 
+def _svg_data_uri(smiles, size=(180, 130)):
+    """Return an SVG data URI for embedding in Plotly hover HTML."""
+    from rdkit.Chem.Draw import rdMolDraw2D
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+    drawer = rdMolDraw2D.MolDraw2DSVG(size[0], size[1])
+    drawer.drawOptions().clearBackground = True
+    drawer.DrawMolecule(mol)
+    drawer.FinishDrawing()
+    svg = drawer.GetDrawingText()
+    b64 = base64.b64encode(svg.encode()).decode()
+    return f"data:image/svg+xml;base64,{b64}"
+
+
+def _nearest_ref_smiles(gen_fp, ref_fps, ref_smi_list, k=3):
+    """Return the k reference SMILES nearest to gen_fp by Tanimoto distance."""
+    from rdkit.DataStructs import BulkTanimotoSimilarity, CreateFromBitString
+    # Reconstruct bit vectors for bulk similarity — use dot product on packed arrays
+    sims = ref_fps @ gen_fp / (
+        ref_fps.sum(axis=1) + gen_fp.sum() - ref_fps @ gen_fp + 1e-9
+    )
+    top_k = np.argsort(sims)[::-1][:k]
+    return [ref_smi_list[i] for i in top_k]
+
+
 def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
     """Plot a 2-D PCA of ECFP4 fingerprints with Plotly.
 
-    Reference molecules are shown as small grey dots; generated molecules
-    as large coloured markers. Hovering shows SMILES and properties.
+    Reference molecules are shown as small grey dots with molecule images on
+    hover; generated molecules as large coloured markers with structure images
+    and properties on hover.
 
     Args:
         reference_smiles:  List of reference SMILES (e.g. a PubChem sample).
@@ -201,24 +228,32 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
     ref_coords = coords[:n_ref]
     gen_coords = coords[n_ref:]
 
+    # --- Reference hover: molecule image only (sampled subset for speed) ---
+    ref_hover = []
+    for smi in ref_valid:
+        uri = _svg_data_uri(smi, size=(160, 120))
+        ref_hover.append(
+            f'<img src="{uri}" style="background:white"/><br>'
+            f'<span style="font-size:10px">{smi}</span>'
+            if uri else smi
+        )
+
+    # --- Generated hover: molecule image + properties ---
     gen_props = compute_properties(gen_smi)
-    tooltips = []
+    gen_hover = []
     for smi in gen_smi:
-        row = gen_props[gen_props["SMILES"] == smi]
-        prop_str = ""
-        if not row.empty:
-            r = row.iloc[0]
-            prop_str = f"QED={r['QED']}  MW={r['MW']}  LogP={r['LogP']}"
-        tooltips.append(f"{smi}<br>{prop_str}")
+        uri = _svg_data_uri(smi, size=(200, 150))
+        gen_hover.append(f'<img src="{uri}" style="background:white"/>' if uri else smi)
 
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
         x=ref_coords[:, 0], y=ref_coords[:, 1],
         mode="markers",
-        marker=dict(color="lightgrey", size=3, opacity=0.5),
+        marker=dict(color="lightgrey", size=4, opacity=0.5),
         name="PubChem reference",
-        hoverinfo="skip",
+        text=ref_hover,
+        hovertemplate="%{text}<extra>Reference</extra>",
     ))
 
     fig.add_trace(go.Scatter(
@@ -227,12 +262,12 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
         marker=dict(
             color=gen_props["QED"].tolist() if len(gen_props) == len(gen_smi) else "steelblue",
             colorscale="Viridis",
-            size=12,
+            size=14,
             colorbar=dict(title="QED"),
             line=dict(width=1, color="white"),
         ),
-        text=tooltips,
-        hovertemplate="%{text}<extra></extra>",
+        text=gen_hover,
+        hovertemplate="%{text}<extra>Generated</extra>",
         name="Generated",
     ))
 
@@ -241,7 +276,8 @@ def plot_chemical_space(reference_smiles, generated_smiles, n_ref_display=3000):
         xaxis_title="PC 1",
         yaxis_title="PC 2",
         legend=dict(orientation="h", y=-0.12),
-        height=550,
+        height=580,
+        hoverlabel=dict(bgcolor="white", font_size=12),
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
